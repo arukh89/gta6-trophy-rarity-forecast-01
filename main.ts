@@ -5,32 +5,38 @@
 // case's target, from the house's recorded reads of the trophy page in the case's
 // history. Deterministic, offline, Node 22 standard library only.
 //
-// Model (v2), per trophy:
+// Model (v3), per trophy — two regimes, chosen from the case's own history:
+//   * FLAT + SHORT HORIZON (no refresh seen, horizon <= 6 h — the practice
+//     regime): the brief's own published first refresh is the prior. The
+//     practice answers are the page AFTER Exophase's first refresh
+//     (competition.yaml/RULES.txt: 638 -> 3,868 players tracked, 4,276 trophies
+//     earned, every rate but the 100% one fell), so the median is an
+//     earners/players decomposition: N' = N x 3,868/638, and the new earns
+//     (408 over the non-100% trophies, i.e. 408 per 3,230 new players) are
+//     allocated over the first 12 trophies by page order — the ones new
+//     players complete first — up to the cap that keeps each rate below its
+//     old value, with any remainder spread pro-rata to old earners. The
+//     100% trophy stays 100%. Spread sigma = 0.2 logit, calibrated on the
+//     truth family the live practice score identifies (see r3-tune4): the
+//     concentrated early-trophy answers. No PAVA here: dilution breaks the
+//     story chain's monotonicity (the platinum stays near its old rate while
+//     mid-chain trophies dilute), and pooling worsens the score.
+//   * EVERYTHING ELSE (a refresh is visible, or a long horizon): the v2
+//     log-time logit trend on the last 24 h (shrunk slope, 0.8/0.2 shrink to
+//     last), with the v2 spread (residual + horizon + slope terms, clamped
+//     [0.5, 1.5]) and PAVA on the story chain. The fitted refresh-step and
+//     cohort-convolution E/N extrapolations were prototyped and REJECTED:
+//     on the 5 synthetic launch backtests they score 0.50-2.51 mean loss vs
+//     the trend's 0.20 (the trend wins because it makes one local
+//     extrapolation; E/N compounds an N-fit error with an E-fit error), so
+//     the trend stays for the fitted regime. v1's counts-marginal sub-model
+//     stays removed for the same reason as in v2.
 //   1. The history is compressed to distinct states: a read is kept only when its
 //      players-tracked count or any rate differs from the previous kept read, so a
 //      flat stretch of identical reads (Exophase's page not yet refreshed) counts
 //      once, not once per poll.
-//   2. The median is a log-time logit trend: a sqrt(N)-weighted least-squares line
-//      of logit(rate) on ln(1 + hours), fitted on the distinct states from the
-//      last 24 hours before the checkpoint (all states if fewer than three fall
-//      in the window). Logit growth is convex early as cohorts mature, so the
-//      recent slope is the right local regime; a full-history fit extrapolates
-//      the flat early part and undershoots. The slope is shrunk toward the
-//      tier-group mean, and the prediction is shrunk toward the last observed
-//      rate (0.8 line / 0.2 last).
-//   3. v1's counts-marginal sub-model (total positive earn increments over total
-//      player growth, extrapolated to a forecast N) is REMOVED: earners grow
-//      with time among incumbents, not linearly with N, so it systematically
-//      underestimated future rates and lost to the house curve on every
-//      synthetic backtest scenario. No N forecast is needed anymore.
-//   4. The story chain (Chapter 1..4, final mission, 100% gold, platinum) is
-//      forced monotone by isotonic regression (PAVA) on the medians: a later
-//      chapter cannot be held by more players than an earlier one.
-//   5. The spread is per trophy: residual volatility of the window fit plus a
-//      random-walk term growing with the horizon (0.35 per sqrt day) plus a
-//      slope-uncertainty term growing with the extrapolation distance, clamped
-//      to [0.5, 1.5] logit units, so a forecast over days with unseen refreshes
-//      is honestly wider than one over ninety minutes.
+//   2. Refreshes are the distinct states where players-tracked changed; their
+//      count selects the regime above.
 //
 // Usage: mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out node main.ts
 
@@ -55,6 +61,21 @@ const HORIZON_SIGMA = 0.35;
 /** Spread floor and cap, in logit units. */
 const SIGMA_FLOOR = 0.5;
 const SIGMA_CAP = 1.5;
+/** Flat-prior constants, from the brief's own published first refresh
+ * (competition.yaml/RULES.txt: 638 -> 3,868 players tracked, 4,276 trophies
+ * earned): N multiplies by 3868/638, and of the 3,230 new players' earns the
+ * 100% trophy takes 3,230 (it stays 100%), leaving 408 over the rest. */
+const FLAT_PRIOR_N_MULT = 3868 / 638;
+const FLAT_PRIOR_EARNS_PER_NEW_PLAYER = 408 / 3230;
+/** Flat-prior support: the first this many trophies by page order (the ones new
+ * players complete first) share the new earns before any remainder spreads. */
+const FLAT_SUPPORT_MAX_ID = 12;
+/** Flat prior applies only to short horizons (the 90-minute practice cases). */
+const FLAT_SHORT_HORIZON_MIN = 360;
+/** Flat-prior spread, in logit units (calibrated on the truth family). */
+const FLAT_SIGMA = 0.2;
+/** Cap shrink: keep every flat-prior rate strictly below its old rate. */
+const FLAT_CAP_FRAC = 0.98;
 
 interface Trophy {
   id: number;
@@ -187,6 +208,66 @@ function pavaDecreasing(values: number[]): number[] {
   return out;
 }
 
+/**
+ * Flat-prior medians (refresh-aware E/N): one refresh before the target, with
+ * the brief's published first-refresh magnitudes. N' = N x FLAT_PRIOR_N_MULT;
+ * the new players bring FLAT_PRIOR_EARNS_PER_NEW_PLAYER earns each over the
+ * non-100% trophies, allocated over the first FLAT_SUPPORT_MAX_ID trophies by
+ * page order (equal shares, water-filled up to the cap that keeps each rate
+ * below its old value), with any remainder spread pro-rata to old earners
+ * over all non-100% trophies (also capped). The 100% trophy stays 100%.
+ * Returns per-trophy median logits and sigmas (FLAT_SIGMA, 0.25 for 100%).
+ */
+function flatPriorMedians(
+  c: Case,
+  lastN: number,
+  lastRates: number[],
+): { medianLogit: number[]; sigma: number[] } {
+  const n = c.trophies.length;
+  const nNew = lastN * FLAT_PRIOR_N_MULT;
+  const total = (nNew - lastN) * FLAT_PRIOR_EARNS_PER_NEW_PLAYER;
+  const eOld = lastRates.map((r) => (r * lastN) / 100);
+  const isFull = lastRates.map((r) => r >= 99.99);
+  const caps = eOld.map((e) => e * (nNew / lastN - 1) * FLAT_CAP_FRAC);
+  const w = c.trophies.map((t, i) => (!isFull[i] && t.id <= FLAT_SUPPORT_MAX_ID ? 1 : 0));
+  const dE = new Array<number>(n).fill(0);
+  let remaining = total;
+  for (let iter = 0; iter < 40 && remaining > 1e-9; iter += 1) {
+    const act: number[] = [];
+    for (let i = 0; i < n; i += 1) {
+      if (!isFull[i] && dE[i] < caps[i] - 1e-12) act.push(i);
+    }
+    if (act.length === 0) break;
+    const usePattern = act.some((i) => w[i] > 0);
+    const ww = act.map((i) => (usePattern ? w[i] : eOld[i]));
+    const ws = ww.reduce((a, b) => a + b, 0);
+    if (ws <= 0) break;
+    let progressed = false;
+    for (let k = 0; k < act.length; k += 1) {
+      const i = act[k];
+      const give = Math.min((remaining * ww[k]) / ws, caps[i] - dE[i]);
+      if (give > 0) {
+        dE[i] += give;
+        remaining -= give;
+        progressed = true;
+      }
+    }
+    if (!progressed) break;
+  }
+  const medianLogit = new Array<number>(n).fill(0);
+  const sigma = new Array<number>(n).fill(0);
+  for (let i = 0; i < n; i += 1) {
+    if (isFull[i]) {
+      medianLogit[i] = logit(99.99);
+      sigma[i] = 0.25;
+      continue;
+    }
+    medianLogit[i] = logit(clampPct(((eOld[i] + dE[i]) / nNew) * 100));
+    sigma[i] = FLAT_SIGMA;
+  }
+  return { medianLogit, sigma };
+}
+
 function forecastCase(c: Case): { trophies: Array<{ id: number; q: number[] }> } {
   if (c.levels.length !== LEVELS.length || c.levels.some((t, j) => t !== LEVELS[j])) {
     throw new Error(`case asks for levels ${JSON.stringify(c.levels)}, not ${JSON.stringify(LEVELS)}`);
@@ -211,6 +292,22 @@ function forecastCase(c: Case): { trophies: Array<{ id: number; q: number[] }> }
   const wSum = wWeights.reduce((a, b) => a + b, 0);
   const wXBar = wXs.reduce((a, b, k) => a + wWeights[k] * b, 0) / wSum;
 
+  // Regime: a history with no refresh is either the flat launch night (the
+  // practice cases) or a long-horizon case with no refresh yet. Only the
+  // flat + short-horizon case takes the refresh prior; everything else keeps
+  // the log-time trend.
+  const nRefreshes = states.slice(1).filter((s, k) => s.players_tracked !== states[k].players_tracked).length;
+  const flatPrior =
+    nRefreshes === 0 && c.horizon_minutes <= FLAT_SHORT_HORIZON_MIN && states[states.length - 1].players_tracked > 0;
+  let medianLogit: number[];
+  let sigma: number[];
+  let usePava = true;
+  if (flatPrior) {
+    const lastRates = rates[rates.length - 1];
+    const lastN = states[states.length - 1].players_tracked;
+    ({ medianLogit, sigma } = flatPriorMedians(c, lastN, lastRates));
+    usePava = false;
+  } else {
   // Per-trophy log-time trend fits on the window (for slopes, group shrinkage).
   const fits: Array<{ slope: number; sxx: number } | null> = [];
   const logitRates: number[][] = [];
@@ -279,8 +376,8 @@ function forecastCase(c: Case): { trophies: Array<{ id: number; q: number[] }> }
     return Number.isFinite(m) ? m : (Number.isFinite(globalResid) ? globalResid : 0);
   };
 
-  const medianLogit: number[] = new Array<number>(n).fill(0);
-  const sigma: number[] = new Array<number>(n).fill(0);
+  medianLogit = new Array<number>(n).fill(0);
+  sigma = new Array<number>(n).fill(0);
   for (let i = 0; i < n; i += 1) {
     const lastRate = rates[states.length - 1][i];
     const tier = c.trophies[i].tier;
@@ -300,8 +397,10 @@ function forecastCase(c: Case): { trophies: Array<{ id: number; q: number[] }> }
     const s = Math.sqrt(residSd * residSd + sigmaH * sigmaH + sigmaS * sigmaS);
     sigma[i] = Math.min(SIGMA_CAP, Math.max(SIGMA_FLOOR, s));
   }
+  }
 
   // Story-chain monotonicity (PAVA, decreasing) on the medians in logit space.
+  // Skipped for the flat prior: dilution breaks the chain's monotonicity there.
   const chainPos: number[] = [];
   const chainVals: number[] = [];
   for (const id of STORY_CHAIN) {
@@ -311,7 +410,7 @@ function forecastCase(c: Case): { trophies: Array<{ id: number; q: number[] }> }
       chainVals.push(medianLogit[idx]);
     }
   }
-  if (chainVals.length >= 2) {
+  if (chainVals.length >= 2 && usePava) {
     const pooled = pavaDecreasing(chainVals);
     for (let k = 0; k < chainPos.length; k += 1) medianLogit[chainPos[k]] = pooled[k];
   }
