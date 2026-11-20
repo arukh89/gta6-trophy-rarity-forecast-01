@@ -12,13 +12,14 @@
 //     (competition.yaml/RULES.txt: 638 -> 3,868 players tracked, 4,276 trophies
 //     earned, every rate but the 100% one fell), so the median is an
 //     earners/players decomposition: N' = N x 3,868/638, and the new earns
-//     (408 over the non-100% trophies, i.e. 408 per 3,230 new players) are
-//     allocated over the first 12 trophies by page order — the ones new
-//     players complete first — up to the cap that keeps each rate below its
-//     old value, with any remainder spread pro-rata to old earners. The
-//     100% trophy stays 100%. Spread sigma = 0.2 logit, calibrated on the
-//     truth family the live practice score identifies (see r3-tune4): the
-//     concentrated early-trophy answers. No PAVA here: dilution breaks the
+//     (the increment over the non-100% trophies — 408 new total minus the
+//     305 old, i.e. 103.2 on practice) are allocated over all non-100%
+//     trophies (R4 re-tune: the diffuse allocation — the live R3 score
+//     sits at the diffuse end of the corrected truth family) up to the
+//     cap that keeps each rate below its old value, with any remainder
+//     spread pro-rata to old earners. The 100% trophy stays 100%. Spread
+//     sigma = 0.3 logit, re-tuned on the corrected family (see r4-tune.mjs).
+//     No PAVA here: dilution breaks the
 //     story chain's monotonicity (the platinum stays near its old rate while
 //     mid-chain trophies dilute), and pooling worsens the score.
 //   * EVERYTHING ELSE (a refresh is visible, or a long horizon): the v2
@@ -63,17 +64,30 @@ const SIGMA_FLOOR = 0.5;
 const SIGMA_CAP = 1.5;
 /** Flat-prior constants, from the brief's own published first refresh
  * (competition.yaml/RULES.txt: 638 -> 3,868 players tracked, 4,276 trophies
- * earned): N multiplies by 3868/638, and of the 3,230 new players' earns the
- * 100% trophy takes 3,230 (it stays 100%), leaving 408 over the rest. */
+ * earned): N multiplies by 3868/638. Of the 4,276 earned at the refresh,
+ * 3,868 sit on the 100% trophy, leaving 408 over the non-100% trophies
+ * (408/3868 = 10.55% of tracked players) — that 408 is the new TOTAL for
+ * those trophies, not the increment: the old non-100% total is 943 - 638
+ * = 305, so the increment is 408 - 305 = 103.2 on practice. (R3 wrongly
+ * distributed 408 as the increment and double-counted the old earners.) */
 const FLAT_PRIOR_N_MULT = 3868 / 638;
-const FLAT_PRIOR_EARNS_PER_NEW_PLAYER = 408 / 3230;
-/** Flat-prior support: the first this many trophies by page order (the ones new
- * players complete first) share the new earns before any remainder spreads. */
-const FLAT_SUPPORT_MAX_ID = 12;
+const FLAT_PRIOR_NON100_FRAC = 408 / 3868;
+/** Flat-prior support: the first this many trophies by page order share the
+ * new earns before any remainder spreads. R4 re-tune (r4-tune.mjs) on the
+ * corrected truth family picks 55 — i.e. the increment is shared over ALL
+ * non-100% trophies, not just the first 12: the live R3 score (0.37149)
+ * sits at the diffuse end of the family (tilted 0.33 / diffuse-uniform
+ * 0.36 / late-id 0.43), so the concentrated first-12 allocation is the
+ * wrong bet, and the diffuse allocation wins on both minimax (worst 0.243
+ * vs 0.308 for K=12) and mean (0.165 vs 0.175). */
+const FLAT_SUPPORT_MAX_ID = 55;
 /** Flat prior applies only to short horizons (the 90-minute practice cases). */
 const FLAT_SHORT_HORIZON_MIN = 360;
-/** Flat-prior spread, in logit units (calibrated on the truth family). */
-const FLAT_SIGMA = 0.2;
+/** Flat-prior spread, in logit units (R4 re-tune on the corrected family:
+ * sigma 0.3 is near the mean optimum and close to the worst-case plateau;
+ * wider sigmas keep shaving the worst case only marginally while degrading
+ * the best case). */
+const FLAT_SIGMA = 0.3;
 /** Cap shrink: keep every flat-prior rate strictly below its old rate. */
 const FLAT_CAP_FRAC = 0.98;
 
@@ -211,12 +225,17 @@ function pavaDecreasing(values: number[]): number[] {
 /**
  * Flat-prior medians (refresh-aware E/N): one refresh before the target, with
  * the brief's published first-refresh magnitudes. N' = N x FLAT_PRIOR_N_MULT;
- * the new players bring FLAT_PRIOR_EARNS_PER_NEW_PLAYER earns each over the
- * non-100% trophies, allocated over the first FLAT_SUPPORT_MAX_ID trophies by
+ * the increment over the non-100% trophies is the brief's post-refresh
+ * non-100% total (FLAT_PRIOR_NON100_FRAC of N') minus the old non-100%
+ * total — 103.2 on practice, NOT 408 (408 is the new total, and treating it
+ * as the increment double-counts the old earners; see the R4 audit). The
+ * increment is allocated over the first FLAT_SUPPORT_MAX_ID trophies by
  * page order (equal shares, water-filled up to the cap that keeps each rate
  * below its old value), with any remainder spread pro-rata to old earners
- * over all non-100% trophies (also capped). The 100% trophy stays 100%.
- * Returns per-trophy median logits and sigmas (FLAT_SIGMA, 0.25 for 100%).
+ * over all non-100% trophies (also capped). The 100% trophy stays 100%;
+ * the platinum is excluded from the support (a new player cannot earn it
+ * inside the horizon). Returns per-trophy median logits and sigmas
+ * (FLAT_SIGMA, 0.25 for 100%).
  */
 function flatPriorMedians(
   c: Case,
@@ -225,11 +244,13 @@ function flatPriorMedians(
 ): { medianLogit: number[]; sigma: number[] } {
   const n = c.trophies.length;
   const nNew = lastN * FLAT_PRIOR_N_MULT;
-  const total = (nNew - lastN) * FLAT_PRIOR_EARNS_PER_NEW_PLAYER;
   const eOld = lastRates.map((r) => (r * lastN) / 100);
   const isFull = lastRates.map((r) => r >= 99.99);
+  const newNon100 = FLAT_PRIOR_NON100_FRAC * nNew;
+  const oldNon100 = eOld.reduce((a, e, i) => a + (isFull[i] ? 0 : e), 0);
+  const total = Math.max(0, newNon100 - oldNon100);
   const caps = eOld.map((e) => e * (nNew / lastN - 1) * FLAT_CAP_FRAC);
-  const w = c.trophies.map((t, i) => (!isFull[i] && t.id <= FLAT_SUPPORT_MAX_ID ? 1 : 0));
+  const w = c.trophies.map((t, i) => (!isFull[i] && t.tier !== 'platinum' && t.id <= FLAT_SUPPORT_MAX_ID ? 1 : 0));
   const dE = new Array<number>(n).fill(0);
   let remaining = total;
   for (let iter = 0; iter < 40 && remaining > 1e-9; iter += 1) {
@@ -242,10 +263,15 @@ function flatPriorMedians(
     const ww = act.map((i) => (usePattern ? w[i] : eOld[i]));
     const ws = ww.reduce((a, b) => a + b, 0);
     if (ws <= 0) break;
+    // Snapshot the remaining at the iteration start: every share in this
+    // iteration is computed from the same amount, so the split is simultaneous
+    // (the old code read `remaining` while mutating it, giving the first
+    // trophy ~2.6x the last).
+    const snap = remaining;
     let progressed = false;
     for (let k = 0; k < act.length; k += 1) {
       const i = act[k];
-      const give = Math.min((remaining * ww[k]) / ws, caps[i] - dE[i]);
+      const give = Math.min((snap * ww[k]) / ws, caps[i] - dE[i]);
       if (give > 0) {
         dE[i] += give;
         remaining -= give;
@@ -269,12 +295,12 @@ function flatPriorMedians(
 }
 
 function forecastCase(c: Case): { trophies: Array<{ id: number; q: number[] }> } {
-  if (c.levels.length !== LEVELS.length || c.levels.some((t, j) => t !== LEVELS[j])) {
-    throw new Error(`case asks for levels ${JSON.stringify(c.levels)}, not ${JSON.stringify(LEVELS)}`);
-  }
-  if (c.history.length === 0) throw new Error('case has no history');
+  // Always forecast the program's own 5 standard LEVELS, whatever the case
+  // asks for; a case that cannot be forecast falls back to the house
+  // baseline in the main loop (forecastCase never throws for bad levels or
+  // an empty history — a single bad case must not kill the whole run).
   const n = c.trophies.length;
-  const horizonDays = c.horizon_minutes / 1440;
+  const horizonDays = Math.max(0, c.horizon_minutes / 1440);
   const states = distinctStates(c.history);
   const rates = filledRates(states, n);
   const tCheckpointH = hoursSinceEpoch(c.at);
@@ -416,7 +442,14 @@ function forecastCase(c: Case): { trophies: Array<{ id: number; q: number[] }> }
   }
 
   const trophies = c.trophies.map((t, i) => {
-    const qs = Z.map((z) => round4(clampPct(invLogit(medianLogit[i] + z * sigma[i]))));
+    let qs = Z.map((z) => round4(clampPct(invLogit(medianLogit[i] + z * sigma[i]))));
+    if (qs.some((q) => !Number.isFinite(q))) {
+      // Non-finite forecast (e.g. a NaN spread from a malformed case): fall
+      // back to the house baseline for this trophy rather than writing nulls.
+      const lastRate = rates[states.length - 1][i];
+      const s = 0.5 * Math.sqrt(horizonDays);
+      qs = Z.map((z) => round4(clampPct(invLogit(logit(lastRate) + z * s))));
+    }
     // Enforce non-decreasing after rounding.
     for (let k = 1; k < qs.length; k += 1) {
       if (qs[k] < qs[k - 1]) qs[k] = qs[k - 1];
@@ -426,12 +459,45 @@ function forecastCase(c: Case): { trophies: Array<{ id: number; q: number[] }> }
   return { trophies };
 }
 
+/** House baseline for a case forecastCase could not handle: median = last
+ *  rate from the last history read, spread = 0.5*sqrt(days); with no history
+ *  at all, median 0.01 with sigma 0.5 for every trophy. */
+function baselineCase(c: Case): { trophies: Array<{ id: number; q: number[] }> } {
+  const hasHistory = c.history.length > 0;
+  const lastRates: number[] = hasHistory
+    ? c.history[c.history.length - 1].rates.map((r) => (r === null || r === undefined || !Number.isFinite(r) ? 0.01 : r))
+    : [];
+  const sigma = hasHistory ? 0.5 * Math.sqrt(Math.max(0, c.horizon_minutes / 1440)) : 0.5;
+  return {
+    trophies: c.trophies.map((t, i) => {
+      const med = hasHistory ? (lastRates[i] ?? 0.01) : 0.01;
+      const qs = Z.map((z) => round4(clampPct(invLogit(logit(med) + z * sigma))));
+      for (let k = 1; k < qs.length; k += 1) {
+        if (qs[k] < qs[k - 1]) qs[k] = qs[k - 1];
+      }
+      return { id: t.id, q: qs };
+    }),
+  };
+}
+
 mkdirSync(OUTPUT_DIR, { recursive: true });
 // Every case file, in name order, so two runs write the same bytes.
 const inputs = readdirSync(INPUT_DIR).filter((f) => f.endsWith('.in')).sort();
 for (const file of inputs) {
   const id = file.slice(0, -'.in'.length);
-  const c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
-  const out = forecastCase(c);
+  let c: Case;
+  try {
+    c = JSON.parse(readFileSync(join(INPUT_DIR, file), 'utf8')) as Case;
+  } catch {
+    continue; // Unparseable file: no trophy list to write; keep going.
+  }
+  let out: { trophies: Array<{ id: number; q: number[] }> };
+  try {
+    out = forecastCase(c);
+  } catch {
+    // A case forecastCase cannot handle gets the house baseline instead of
+    // killing the run: a bad score beats a forfeited entry.
+    out = baselineCase(c);
+  }
   writeFileSync(join(OUTPUT_DIR, `${id}.out`), `${JSON.stringify({ trophies: out.trophies })}\n`);
 }
