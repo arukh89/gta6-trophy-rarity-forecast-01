@@ -18,7 +18,9 @@
 //     sits at the diffuse end of the corrected truth family) up to the
 //     cap that keeps each rate below its old value, with any remainder
 //     spread pro-rata to old earners. The 100% trophy stays 100%. Spread
-//     sigma = 0.3 logit, re-tuned on the corrected family (see r4-tune.mjs).
+//     sigma = 0.35 logit, re-tuned on the corrected family (see r4-tune.mjs;
+//     0.35 is the minimax pick: worst 0.2360, mean 0.1652 on the corrected
+//     family, best mean of the grid; 0.3 is better only on diffuse truths).
 //     No PAVA here: dilution breaks the
 //     story chain's monotonicity (the platinum stays near its old rate while
 //     mid-chain trophies dilute), and pooling worsens the score.
@@ -78,16 +80,15 @@ const FLAT_PRIOR_NON100_FRAC = 408 / 3868;
  * non-100% trophies, not just the first 12: the live R3 score (0.37149)
  * sits at the diffuse end of the family (tilted 0.33 / diffuse-uniform
  * 0.36 / late-id 0.43), so the concentrated first-12 allocation is the
- * wrong bet, and the diffuse allocation wins on both minimax (worst 0.243
+ * wrong bet, and the diffuse allocation wins on both minimax (worst 0.236
  * vs 0.308 for K=12) and mean (0.165 vs 0.175). */
 const FLAT_SUPPORT_MAX_ID = 55;
 /** Flat prior applies only to short horizons (the 90-minute practice cases). */
 const FLAT_SHORT_HORIZON_MIN = 360;
 /** Flat-prior spread, in logit units (R4 re-tune on the corrected family:
- * sigma 0.3 is near the mean optimum and close to the worst-case plateau;
- * wider sigmas keep shaving the worst case only marginally while degrading
- * the best case). */
-const FLAT_SIGMA = 0.3;
+ * sigma 0.35 is the minimax pick (worst 0.2360, mean 0.1652 — best mean of
+ * the grid); 0.3 is better only on diffuse truths, 0.4 only on worst case). */
+const FLAT_SIGMA = 0.35;
 /** Cap shrink: keep every flat-prior rate strictly below its old rate. */
 const FLAT_CAP_FRAC = 0.98;
 
